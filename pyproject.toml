@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openedx-lti-bridge"
+version = "0.1.0"
+description = "Open edX LTI bridge to preserve POST across LTI social-auth login"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = [  ]
+
+[tool.setuptools]
+packages = ["lti_bridge"]  
