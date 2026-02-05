@@ -1,7 +1,6 @@
-import json
+from urllib.parse import unquote
 
 from django.http import HttpResponse, HttpResponseBadRequest
-from django.middleware.csrf import get_token
 from django.shortcuts import redirect
 from django.utils.html import escape
 from django.views.decorators.http import require_http_methods
@@ -9,23 +8,34 @@ from django.views.decorators.http import require_http_methods
 SESSION_TARGET_KEY = "lti_bridge_target"
 SESSION_PAYLOAD_KEY = "lti_bridge_payload"
 
-# Puedes mantenerlo en settings como ya haces
-DEFAULT_LOGIN_URL = "/auth/login/lti/"
+LTI_LOGIN_URL = "/auth/login/lti/"
+
+
+def _is_safe_internal_path(path: str) -> bool:
+    """
+    Accept only internal absolute paths like '/foo/bar'.
+    Reject scheme/host ('http://'), protocol-relative ('//evil.com'), etc.
+    """
+    if not path or not isinstance(path, str):
+        return False
+    if not path.startswith("/"):
+        return False
+    if path.startswith("//"):
+        return False
+    if "://" in path:
+        return False
+    if "\x00" in path:
+        return False
+    return True
 
 
 def _autosubmit_post_html(action_url: str, fields: dict, title: str = "Redirecting...") -> str:
-    """
-    Returns a minimal HTML page with an auto-submitting POST form.
-    """
     inputs = []
     for k, v in (fields or {}).items():
-        # LTI params are strings; if not, serialize to string
         if v is None:
             v = ""
-        elif not isinstance(v, str):
-            v = json.dumps(v)
         inputs.append(
-            f'<input type="hidden" name="{escape(str(k))}" value="{escape(v)}"/>'
+            f'<input type="hidden" name="{escape(str(k))}" value="{escape(str(v))}"/>'
         )
 
     return f"""<!doctype html>
@@ -39,11 +49,9 @@ def _autosubmit_post_html(action_url: str, fields: dict, title: str = "Redirecti
   <noscript>
     <p>This step requires JavaScript to submit a POST request.</p>
   </noscript>
-
   <form id="lti-bridge-form" method="post" action="{escape(action_url)}">
     {''.join(inputs)}
   </form>
-
   <script>
     document.getElementById("lti-bridge-form").submit();
   </script>
@@ -55,53 +63,50 @@ def _autosubmit_post_html(action_url: str, fields: dict, title: str = "Redirecti
 @require_http_methods(["GET", "POST"])
 def launch(request):
     """
-    Entry point called by your tool/consumer:
-    - Receives target (where to finally POST) and payload (LTI params)
-    - Stores them in session
-    - Sends user through Open edX LTI login endpoint via auto-submitting POST
+    Called by the external tool/consumer.
+
+    - target is provided as an internal path, e.g. /lti_provider/courses/...
+      (can come in querystring like ?target=%2F... or as POST field)
+    - LTI 1.1 launch params MUST come by POST (oauth_* etc.)
     """
-    target = request.POST.get("target") or request.GET.get("target")
-    payload_raw = request.POST.get("payload") or request.GET.get("payload")
+    # 1) Extract target from GET or POST
+    target = request.POST.get("target") or request.GET.get("target") or ""
+    # If target is percent-encoded (like in your example), unquote is fine
+    target = unquote(target)
 
-    if not target or not payload_raw:
-        return HttpResponseBadRequest("Missing 'target' or 'payload'.")
+    if not _is_safe_internal_path(target):
+        return HttpResponseBadRequest("Invalid target: must be an internal path starting with '/'.")
 
-    try:
-        payload = json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
-        if not isinstance(payload, dict):
-            return HttpResponseBadRequest("'payload' must be a JSON object.")
-    except Exception:
-        return HttpResponseBadRequest("Invalid JSON in 'payload'.")
+    # 2) LTI payload must be POSTed (signed)
+    if request.method != "POST":
+        return HttpResponseBadRequest("LTI launch must be POST. Send LTI params in POST, target can be in querystring.")
 
-    # Store for after authentication
+    payload = request.POST.dict()
+    payload.pop("target", None)  # keep target out of LTI payload
+
+    # Minimal LTI 1.1 sanity check
+    if "oauth_consumer_key" not in payload or "oauth_signature" not in payload:
+        return HttpResponseBadRequest("Missing LTI OAuth fields (oauth_consumer_key/oauth_signature).")
+
+    # 3) Store for after authentication
     request.session[SESSION_TARGET_KEY] = target
     request.session[SESSION_PAYLOAD_KEY] = payload
-
-    # Ensure session is saved before redirecting into auth
     request.session.modified = True
 
-    # POST into the LTI login endpoint (no next= supported)
-    login_url = getattr(request, "site", None)  # not used; keep simple
-    login_url = DEFAULT_LOGIN_URL
-
-    # If /auth/login/lti/ is CSRF-exempt (usual), you don't need csrftoken.
-    # If it isn't, you'd need to include csrfmiddlewaretoken. Generally it is exempt.
-    html = _autosubmit_post_html(login_url, fields={}, title="Signing you in...")
+    # 4) POST into Open edX LTI login endpoint with the same signed payload
+    html = _autosubmit_post_html(LTI_LOGIN_URL, payload, title="Signing you in…")
     return HttpResponse(html)
 
 
 @require_http_methods(["GET"])
 def continue_launch(request):
     """
-    After social-auth finishes, our pipeline redirects here.
-    We then POST the original LTI payload to the original target.
+    After authentication, redirect internally to the stored target.
     """
     target = request.session.pop(SESSION_TARGET_KEY, None)
-    payload = request.session.pop(SESSION_PAYLOAD_KEY, None)
+    request.session.pop(SESSION_PAYLOAD_KEY, None)  # no longer needed after login
 
-    if not target or not payload:
-        # Nothing to continue: go somewhere safe (or return 400)
+    if not _is_safe_internal_path(target or ""):
         return redirect("/")
 
-    html = _autosubmit_post_html(target, payload, title="Continuing...")
-    return HttpResponse(html)
+    return redirect(target)
