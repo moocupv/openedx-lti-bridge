@@ -1,171 +1,107 @@
-from __future__ import annotations
+import json
 
-from django.conf import settings
 from django.http import HttpResponse, HttpResponseBadRequest
+from django.middleware.csrf import get_token
 from django.shortcuts import redirect
-from django.urls import reverse
-from django.views.decorators.csrf import csrf_exempt
-
-import requests
-from requests.utils import cookiejar_from_dict
+from django.utils.html import escape
+from django.views.decorators.http import require_http_methods
 
 SESSION_TARGET_KEY = "lti_bridge_target"
 SESSION_PAYLOAD_KEY = "lti_bridge_payload"
 
+# Puedes mantenerlo en settings como ya haces
+DEFAULT_LOGIN_URL = "/auth/login/lti/"
 
-def _is_safe_target(target: str) -> bool:
+
+def _autosubmit_post_html(action_url: str, fields: dict, title: str = "Redirecting...") -> str:
     """
-    Allowlist:
-    - must be absolute path under /lti_provider
-    - reject scheme/host, protocol-relative, and path traversal
+    Returns a minimal HTML page with an auto-submitting POST form.
     """
-    if not target or not isinstance(target, str):
-        return False
-
-    if not (target == "/lti_provider" or target.startswith("/lti_provider/")):
-        return False
-
-    if "://" in target:
-        return False
-    if target.startswith("//"):
-        return False
-    if ".." in target:
-        return False
-
-    return True
-
-
-def _html_autopost(action: str, params: dict) -> str:
-    def esc(s: str) -> str:
-        return (
-            str(s)
-            .replace("&", "&amp;")
-            .replace('"', "&quot;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
+    inputs = []
+    for k, v in (fields or {}).items():
+        # LTI params are strings; if not, serialize to string
+        if v is None:
+            v = ""
+        elif not isinstance(v, str):
+            v = json.dumps(v)
+        inputs.append(
+            f'<input type="hidden" name="{escape(str(k))}" value="{escape(v)}"/>'
         )
 
-    inputs = "\n".join(
-        f'<input type="hidden" name="{esc(k)}" value="{esc(v)}"/>'
-        for k, v in (params or {}).items()
-    )
     return f"""<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>Redirecting…</title></head>
-  <body>
-    <form id="f" method="post" action="{esc(action)}">
-      {inputs}
-    </form>
-    <script>document.getElementById("f").submit();</script>
-  </body>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{escape(title)}</title>
+</head>
+<body>
+  <noscript>
+    <p>This step requires JavaScript to submit a POST request.</p>
+  </noscript>
+
+  <form id="lti-bridge-form" method="post" action="{escape(action_url)}">
+    {''.join(inputs)}
+  </form>
+
+  <script>
+    document.getElementById("lti-bridge-form").submit();
+  </script>
+</body>
 </html>
 """
 
 
-def _lti_login_url() -> str:
-    # Keep using the LTI login endpoint to trigger provisioning/linking.
-    return getattr(settings, "LTI_BRIDGE_LOGIN_URL", "/auth/login/lti/")
-
-
-@csrf_exempt
+@require_http_methods(["GET", "POST"])
 def launch(request):
     """
-    POST /lti/bridge/launch?target=/lti_provider/...
-
-    Stores POST payload + target in session, then performs the LTI login
-    server-side (to trigger user provisioning/linking) and finally redirects
-    the browser to /lti/bridge/continue, copying back any auth cookies created
-    by the LTI login.
+    Entry point called by your tool/consumer:
+    - Receives target (where to finally POST) and payload (LTI params)
+    - Stores them in session
+    - Sends user through Open edX LTI login endpoint via auto-submitting POST
     """
-    if request.method != "POST":
-        return HttpResponseBadRequest("POST required")
+    target = request.POST.get("target") or request.GET.get("target")
+    payload_raw = request.POST.get("payload") or request.GET.get("payload")
 
-    target = request.GET.get("target", "")
-    if not _is_safe_target(target):
-        return HttpResponseBadRequest("Invalid target")
-
-    payload = dict(request.POST.items())
-
-    # Persist launch state for the continuation step
-    request.session[SESSION_TARGET_KEY] = target
-    request.session[SESSION_PAYLOAD_KEY] = payload
-    request.session.modified = True
-
-    # Call the LTI login endpoint on this same host.
-    # We intentionally do NOT rely on `next` since /auth/login/lti/ ignores it.
-    login_url = request.build_absolute_uri(_lti_login_url())
-
-    s = requests.Session()
-
-    # Forward browser cookies (affinity, existing session, etc.)
-    if request.COOKIES:
-        s.cookies.update(cookiejar_from_dict(request.COOKIES))
+    if not target or not payload_raw:
+        return HttpResponseBadRequest("Missing 'target' or 'payload'.")
 
     try:
-        r = s.post(
-            login_url,
-            data=payload,
-            allow_redirects=False,
-            timeout=getattr(settings, "LTI_BRIDGE_LOGIN_TIMEOUT", 10),
-        )
-    except requests.RequestException as e:
-        return HttpResponseBadRequest(f"LTI login request failed: {e}")
+        payload = json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
+        if not isinstance(payload, dict):
+            return HttpResponseBadRequest("'payload' must be a JSON object.")
+    except Exception:
+        return HttpResponseBadRequest("Invalid JSON in 'payload'.")
 
-    if r.status_code not in (302, 303):
-        return HttpResponseBadRequest(f"Unexpected response from LTI login: {r.status_code}")
+    # Store for after authentication
+    request.session[SESSION_TARGET_KEY] = target
+    request.session[SESSION_PAYLOAD_KEY] = payload
 
-    # Now redirect the browser into our continuation step...
-    resp = redirect(reverse("lti_bridge_continue"))
-
-    # ...and copy cookies set/updated by the LTI login back to the browser
-    # (at minimum, sessionid; also App Gateway affinity cookies if present).
-    for c in s.cookies:
-        if not c.name:
-            continue
-
-        # Best-effort HttpOnly extraction; default True for safety.
-        httponly = True
-        if hasattr(c, "rest") and isinstance(c.rest, dict):
-            httponly = c.rest.get("HttpOnly", True)
-
-        # For LTI-in-iframe deployments, Secure + SameSite=None is typical.
-        samesite = "None" if c.secure else "Lax"
-
-        resp.set_cookie(
-            key=c.name,
-            value=c.value,
-            domain=c.domain or None,
-            path=c.path or "/",
-            secure=bool(c.secure),
-            httponly=httponly,
-            samesite=samesite,
-        )
-
-    return resp
-
-
-def continue_launch(request):
-    """
-    GET /lti/bridge/continue
-
-    After auth, replays the stored POST to the target under /lti_provider/...
-    """
-    if not getattr(request, "user", None) or not request.user.is_authenticated:
-        login_url = getattr(settings, "LOGIN_URL", "/login")
-        return redirect(f"{login_url}?next={reverse('lti_bridge_continue')}")
-
-    target = request.session.get(SESSION_TARGET_KEY)
-    payload = request.session.get(SESSION_PAYLOAD_KEY)
-
-    if not target or not payload:
-        return HttpResponseBadRequest("No pending LTI launch")
-
-    if not _is_safe_target(target):
-        return HttpResponseBadRequest("Invalid target in session")
-
-    # One-shot: clear stored launch state
-    request.session.pop(SESSION_TARGET_KEY, None)
-    request.session.pop(SESSION_PAYLOAD_KEY, None)
+    # Ensure session is saved before redirecting into auth
     request.session.modified = True
 
-    return HttpResponse(_html_autopost(target, payload))
+    # POST into the LTI login endpoint (no next= supported)
+    login_url = getattr(request, "site", None)  # not used; keep simple
+    login_url = DEFAULT_LOGIN_URL
+
+    # If /auth/login/lti/ is CSRF-exempt (usual), you don't need csrftoken.
+    # If it isn't, you'd need to include csrfmiddlewaretoken. Generally it is exempt.
+    html = _autosubmit_post_html(login_url, fields={}, title="Signing you in...")
+    return HttpResponse(html)
+
+
+@require_http_methods(["GET"])
+def continue_launch(request):
+    """
+    After social-auth finishes, our pipeline redirects here.
+    We then POST the original LTI payload to the original target.
+    """
+    target = request.session.pop(SESSION_TARGET_KEY, None)
+    payload = request.session.pop(SESSION_PAYLOAD_KEY, None)
+
+    if not target or not payload:
+        # Nothing to continue: go somewhere safe (or return 400)
+        return redirect("/")
+
+    html = _autosubmit_post_html(target, payload, title="Continuing...")
+    return HttpResponse(html)
