@@ -4,12 +4,12 @@ from django.http import HttpResponse, HttpResponseBadRequest
 from django.shortcuts import redirect
 from django.utils.html import escape
 from django.views.decorators.http import require_http_methods
+from django.conf import settings
 
 SESSION_TARGET_KEY = "lti_bridge_target"
 SESSION_PAYLOAD_KEY = "lti_bridge_payload"
 
-LTI_LOGIN_URL = "/auth/login/lti/"
-
+LTI_LOGIN_URL = getattr(settings, "LTI_BRIDGE_LOGIN_URL", "/auth/login/lti/")
 
 def _is_safe_internal_path(path: str) -> bool:
     """
@@ -27,7 +27,6 @@ def _is_safe_internal_path(path: str) -> bool:
     if "\x00" in path:
         return False
     return True
-
 
 def _autosubmit_post_html(action_url: str, fields: dict, title: str = "Redirecting...") -> str:
     inputs = []
